@@ -192,8 +192,8 @@ internal class FunctionInlining(val context: Context): IrElementTransformerWithC
 //        println()
 
         data.value = data.value or childIsBad.value
-        //val currentCalleeIsBad = argsAreBad.value or childIsBad.value or functionDeclaration.second// or (context.ir.symbols.entryPoint == null)
-        val currentCalleeIsBad = true
+        val currentCalleeIsBad = argsAreBad.value or childIsBad.value or functionDeclaration.second// or (context.ir.symbols.entryPoint == null)
+        //val currentCalleeIsBad = true
         val inliner = Inliner(globalSubstituteMap, functionDeclaration.first,
                 !currentCalleeIsBad, currentScope!!,
                 allScopes.map { it.irElement }.filterIsInstance<IrDeclarationParent>().lastOrNull(), context, this)
