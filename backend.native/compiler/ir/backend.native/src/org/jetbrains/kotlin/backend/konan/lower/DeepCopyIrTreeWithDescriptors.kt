@@ -7,40 +7,247 @@ package org.jetbrains.kotlin.backend.konan.lower
 
 import org.jetbrains.kotlin.backend.common.*
 import org.jetbrains.kotlin.backend.common.IrElementVisitorVoidWithContext
+import org.jetbrains.kotlin.backend.common.descriptors.*
 import org.jetbrains.kotlin.backend.common.lower.SimpleMemberScope
 import org.jetbrains.kotlin.backend.konan.Context
 import org.jetbrains.kotlin.backend.konan.descriptors.createExtensionReceiver
 import org.jetbrains.kotlin.backend.konan.descriptors.initialize
+import org.jetbrains.kotlin.backend.konan.descriptors.needsInlining
 import org.jetbrains.kotlin.descriptors.*
 import org.jetbrains.kotlin.descriptors.impl.*
 import org.jetbrains.kotlin.ir.IrElement
+import org.jetbrains.kotlin.ir.IrStatement
 import org.jetbrains.kotlin.ir.declarations.*
 import org.jetbrains.kotlin.ir.declarations.impl.*
 import org.jetbrains.kotlin.ir.descriptors.IrTemporaryVariableDescriptorImpl
 import org.jetbrains.kotlin.ir.expressions.*
 import org.jetbrains.kotlin.ir.expressions.impl.*
-import org.jetbrains.kotlin.ir.symbols.impl.createClassSymbolOrNull
-import org.jetbrains.kotlin.ir.symbols.impl.createFunctionSymbol
-import org.jetbrains.kotlin.ir.types.IrSimpleType
-import org.jetbrains.kotlin.ir.types.IrType
-import org.jetbrains.kotlin.ir.types.makeNullable
-import org.jetbrains.kotlin.ir.types.toKotlinType
+import org.jetbrains.kotlin.ir.symbols.*
+import org.jetbrains.kotlin.ir.symbols.impl.*
+import org.jetbrains.kotlin.ir.types.*
+import org.jetbrains.kotlin.ir.types.impl.IrSimpleTypeImpl
+import org.jetbrains.kotlin.ir.types.impl.IrTypeProjectionImpl
+import org.jetbrains.kotlin.ir.types.impl.originalKotlinType
 import org.jetbrains.kotlin.ir.util.*
-import org.jetbrains.kotlin.ir.visitors.acceptVoid
-import org.jetbrains.kotlin.ir.visitors.transformChildrenVoid
+import org.jetbrains.kotlin.ir.visitors.*
+import org.jetbrains.kotlin.name.FqName
 import org.jetbrains.kotlin.name.Name
 import org.jetbrains.kotlin.resolve.DescriptorUtils
 import org.jetbrains.kotlin.resolve.descriptorUtil.getSuperClassOrAny
 import org.jetbrains.kotlin.resolve.descriptorUtil.getSuperInterfaces
 import org.jetbrains.kotlin.storage.LockBasedStorageManager
-import org.jetbrains.kotlin.types.KotlinType
-import org.jetbrains.kotlin.types.TypeSubstitutor
-import org.jetbrains.kotlin.types.TypeUtils
-import org.jetbrains.kotlin.types.Variance
+import org.jetbrains.kotlin.types.*
+import java.util.HashMap
+import kotlin.reflect.full.primaryConstructor
+import kotlin.reflect.jvm.isAccessible
+
+private class IrTypeProjectionImplForInliner(override val type: IrType, override val variance: Variance) : IrTypeProjection
+
+internal class DeepCopyIrTreeZzz(val context: Context,
+                                 val targetDescriptor: FunctionDescriptor,
+                                 val parent: IrDeclarationParent?) : IrCopierForInliner {
+
+    override fun copy(irElement: IrElement, typeSubstitutor: TypeSubstitutor?): IrElement {
+        if (typeSubstitutor != null)
+            TODO("not implemented") //To change body of created functions use File | Settings | File Templates.
+        return copy(irElement = irElement, typeArguments = null)
+    }
+
+    override fun copy(irElement: IrElement, typeArguments: Map<IrTypeParameterSymbol, IrType?>?): IrElement {
+        irElement.acceptVoid(symbolRemapper)
+        symbolRemapper.typeArguments = typeArguments
+        val copier = DeepCopyIrTreeWithSymbols(
+                symbolRemapper,
+                TypeRemapperImpl(symbolRemapper, typeArguments),
+                SymbolRenamerImpl()
+        )
+        val result = irElement.transform(copier, data = null)
+        result.acceptVoid(object: IrElementVisitorVoid {
+            override fun visitElement(element: IrElement) {
+                element.acceptChildrenVoid(this)
+            }
+
+            override fun visitClass(declaration: IrClass) {
+                (declaration.descriptor as WrappedClassDescriptor).bind(declaration)
+                declaration.acceptChildrenVoid(this)
+            }
+
+            override fun visitConstructor(declaration: IrConstructor) {
+                (declaration.descriptor as WrappedClassConstructorDescriptor).bind(declaration)
+                declaration.acceptChildrenVoid(this)
+            }
+
+            override fun visitEnumEntry(declaration: IrEnumEntry) {
+                (declaration.descriptor as WrappedClassDescriptor).bind(
+                        declaration.correspondingClass ?: declaration.parentAsClass)
+                declaration.acceptChildrenVoid(this)
+            }
+
+            override fun visitField(declaration: IrField) {
+                (declaration.descriptor as WrappedPropertyDescriptor).bind(declaration)
+                declaration.acceptChildrenVoid(this)
+            }
+
+            override fun visitFunction(declaration: IrFunction) {
+                (declaration.descriptor as WrappedSimpleFunctionDescriptor).bind(declaration as IrSimpleFunction)
+                declaration.typeParameters.forEach {
+                    (it.descriptor as WrappedTypeParameterDescriptor).bind(it)
+                }
+                declaration.acceptChildrenVoid(this)
+            }
+
+            override fun visitValueParameter(declaration: IrValueParameter) {
+                (declaration.descriptor as? WrappedValueParameterDescriptor)?.bind(declaration)
+                (declaration.descriptor as? WrappedReceiverParameterDescriptor)?.bind(declaration)
+                declaration.acceptChildrenVoid(this)
+            }
+
+            override fun visitVariable(declaration: IrVariable) {
+                (declaration.descriptor as WrappedVariableDescriptor).bind(declaration)
+                declaration.acceptChildrenVoid(this)
+            }
+        })
+        result.patchDeclarationParents(parent)
+        return result
+    }
+
+    private var nameIndex = 0
+
+    private fun generateCopyName(name: Name): Name {
+        val declarationName = name.toString()                                           // Name of declaration
+        val indexStr        = (nameIndex++).toString()                                  // Unique for inline target index
+        return Name.identifier(declarationName + "_" + indexStr)
+    }
+
+    private inner class SymbolRenamerImpl : SymbolRenamer {
+        private val map = mutableMapOf<IrSymbol, Name>()
+
+        override fun getClassName(symbol: IrClassSymbol) = map.getOrPut(symbol) { generateCopyName(symbol.owner.name) }
+        override fun getFunctionName(symbol: IrSimpleFunctionSymbol) = map.getOrPut(symbol) { generateCopyName(symbol.owner.name) }
+        override fun getFieldName(symbol: IrFieldSymbol) = symbol.owner.name
+        override fun getFileName(symbol: IrFileSymbol) = symbol.owner.fqName
+        override fun getExternalPackageFragmentName(symbol: IrExternalPackageFragmentSymbol) = symbol.owner.fqName
+        override fun getEnumEntryName(symbol: IrEnumEntrySymbol) = symbol.owner.name
+        override fun getVariableName(symbol: IrVariableSymbol) = map.getOrPut(symbol) { generateCopyName(symbol.owner.name) }
+        override fun getTypeParameterName(symbol: IrTypeParameterSymbol) = symbol.owner.name
+        override fun getValueParameterName(symbol: IrValueParameterSymbol) = symbol.owner.name
+    }
+
+    private val descriptorSubstituteMap: MutableMap<DeclarationDescriptor, DeclarationDescriptor> = mutableMapOf()
+
+    private inner class DescriptorsToIrRemapper : DescriptorsRemapper {
+        override fun remapDeclaredClass(descriptor: ClassDescriptor): ClassDescriptor {
+            return WrappedClassDescriptor().also { descriptorSubstituteMap[descriptor] = it }
+        }
+
+        override fun remapDeclaredConstructor(descriptor: ClassConstructorDescriptor): ClassConstructorDescriptor {
+            return WrappedClassConstructorDescriptor().also { descriptorSubstituteMap[descriptor] = it }
+        }
+
+        override fun remapDeclaredEnumEntry(descriptor: ClassDescriptor): ClassDescriptor {
+            return WrappedClassDescriptor().also { descriptorSubstituteMap[descriptor] = it }
+        }
+
+        override fun remapDeclaredField(descriptor: PropertyDescriptor): PropertyDescriptor {
+            return WrappedPropertyDescriptor().also { descriptorSubstituteMap[descriptor] = it }
+        }
+
+        override fun remapDeclaredSimpleFunction(descriptor: FunctionDescriptor): FunctionDescriptor {
+            return WrappedSimpleFunctionDescriptor().also { descriptorSubstituteMap[descriptor] = it }
+        }
+
+        override fun remapDeclaredTypeParameter(descriptor: TypeParameterDescriptor): TypeParameterDescriptor {
+            return WrappedTypeParameterDescriptor().also { descriptorSubstituteMap[descriptor] = it }
+        }
+
+        override fun remapDeclaredValueParameter(descriptor: ParameterDescriptor): ParameterDescriptor {
+            if (descriptor is ReceiverParameterDescriptor)
+                return WrappedReceiverParameterDescriptor().also { descriptorSubstituteMap[descriptor] = it }
+            return WrappedValueParameterDescriptor().also { descriptorSubstituteMap[descriptor] = it }
+        }
+
+        override fun remapDeclaredVariable(descriptor: VariableDescriptor): VariableDescriptor {
+            return WrappedVariableDescriptor().also { descriptorSubstituteMap[descriptor] = it }
+        }
+    }
+
+    private inner class TypeRemapperImpl(val symbolRemapper: SymbolRemapper,
+                                         val typeArguments: Map<IrTypeParameterSymbol, IrType?>?) : TypeRemapper {
+
+        override fun enterScope(irTypeParametersContainer: IrTypeParametersContainer) { }
+
+        override fun leaveScope() { }
+
+        override fun remapType(type: IrType): IrType {
+            if (type !is IrSimpleType) return type
+
+            val substitutedType = typeArguments?.get(type.classifier)
+            if (substitutedType != null) {
+                return IrSimpleTypeImpl(
+                        null,
+                        substitutedType.classifierOrFail,
+                        type.hasQuestionMark or substitutedType.isMarkedNullable(),
+                        emptyList(), emptyList()
+                )
+            }
+
+            val classifier = symbolRemapper.getReferencedClassifier(type.classifier)
+
+            val arguments = type.arguments.map {
+                if (it is IrTypeProjection) {
+                    IrTypeProjectionImplForInliner(this.remapType(it.type), it.variance)
+                } else if (it is IrSimpleType) {
+                    remapType(it) as IrTypeProjection
+                } else {
+                    it
+                }
+            }
+
+            return IrSimpleTypeImpl(
+                    null,
+                    classifier,
+                    type.hasQuestionMark,
+                    arguments,
+                    /*TODO*/emptyList())
+        }
+    }
+
+    override fun addCurrentSubstituteMap(globalSubstituteMap: MutableMap<DeclarationDescriptor, SubstitutedDescriptor>) {
+//        descriptorSubstituteMap.forEach { t, u ->
+//            globalSubstituteMap[t] = SubstitutedDescriptor(targetDescriptor, u)
+//        }
+    }
+
+    private class SymbolRemapperImpl(descriptorsRemapper: DescriptorsRemapper)
+        : DeepCopySymbolRemapper(descriptorsRemapper) {
+
+        var typeArguments: Map<IrTypeParameterSymbol, IrType?>? = null
+            set(value) {
+                field = value?.asSequence()?.associate {
+                    (getReferencedClassifier(it.key) as IrTypeParameterSymbol) to it.value
+                }
+            }
+
+        override fun getReferencedClassifier(symbol: IrClassifierSymbol): IrClassifierSymbol {
+            val result = super.getReferencedClassifier(symbol)
+            if (result !is IrTypeParameterSymbol)
+                return result
+            return typeArguments?.get(result)?.classifierOrNull ?: result
+        }
+    }
+
+    private val symbolRemapper = SymbolRemapperImpl(DescriptorsToIrRemapper())
+}
+
+internal interface IrCopierForInliner {
+    fun copy(irElement: IrElement, typeArguments: Map<IrTypeParameterSymbol, IrType?>?): IrElement
+    fun copy(irElement: IrElement, typeSubstitutor: TypeSubstitutor?): IrElement
+    fun addCurrentSubstituteMap(globalSubstituteMap: MutableMap<DeclarationDescriptor, SubstitutedDescriptor>)
+}
 
 internal class DeepCopyIrTreeWithDescriptors(val targetDescriptor: FunctionDescriptor,
                                              val parentDescriptor: DeclarationDescriptor,
-                                             val context: Context) {
+                                             val context: Context) : IrCopierForInliner {
 
     private val descriptorSubstituteMap: MutableMap<DeclarationDescriptor, DeclarationDescriptor> = mutableMapOf()
     private var typeSubstitutor: TypeSubstitutor? = null
@@ -48,7 +255,11 @@ internal class DeepCopyIrTreeWithDescriptors(val targetDescriptor: FunctionDescr
 
     //-------------------------------------------------------------------------//
 
-    fun copy(irElement: IrElement, typeSubstitutor: TypeSubstitutor?): IrElement {
+    override fun copy(irElement: IrElement, typeArguments: Map<IrTypeParameterSymbol, IrType?>?): IrElement {
+        TODO("not implemented") //To change body of created functions use File | Settings | File Templates.
+    }
+
+    override fun copy(irElement: IrElement, typeSubstitutor: TypeSubstitutor?): IrElement {
         this.typeSubstitutor = typeSubstitutor
         // Create all class descriptors and all necessary descriptors in order to create KotlinTypes.
         irElement.acceptVoid(DescriptorCollectorCreatePhase())
@@ -762,7 +973,7 @@ internal class DeepCopyIrTreeWithDescriptors(val targetDescriptor: FunctionDescr
 
     //-------------------------------------------------------------------------//
 
-    fun addCurrentSubstituteMap(globalSubstituteMap: MutableMap<DeclarationDescriptor, SubstitutedDescriptor>) {
+    override fun addCurrentSubstituteMap(globalSubstituteMap: MutableMap<DeclarationDescriptor, SubstitutedDescriptor>) {
         descriptorSubstituteMap.forEach { t, u ->
             globalSubstituteMap[t] = SubstitutedDescriptor(targetDescriptor, u)
         }
