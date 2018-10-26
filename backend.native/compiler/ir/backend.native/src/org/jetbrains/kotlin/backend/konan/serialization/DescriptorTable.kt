@@ -251,7 +251,7 @@ private val FunctionDescriptor.uniqueName: String
                 return getStringValue(it)!!
             }
             if (!annotations.hasAnnotation(intrinsicAnnotation)) {
-                throw Error("external function $this must have @SymbolName annotation")
+                throw Error("external function $this must have @SymbolName or @Intrinsic annotation")
             }
         }
         // TODO: check that only external function has @SymbolName.
