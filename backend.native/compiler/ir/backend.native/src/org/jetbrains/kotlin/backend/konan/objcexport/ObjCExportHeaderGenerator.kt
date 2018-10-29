@@ -731,7 +731,7 @@ abstract class ObjCExportHeaderGenerator(
 
         val arguments = (throwsAnnotation.allValueArguments.values.single() as ArrayValue).value
         for (argument in arguments) {
-            val classDescriptor = TypeUtils.getClassDescriptor((argument as KClassValue).value) ?: continue
+            val classDescriptor = TypeUtils.getClassDescriptor((argument as KClassValue).getType(method.module)) ?: continue
 
             uncheckedExceptionClasses.firstOrNull { classDescriptor.isSubclassOf(it) }?.let {
                 reportWarning(method,
